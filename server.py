@@ -28,7 +28,7 @@ def receiveData() :
 def createProcess(readyQueue, process, pid) :
     """Adds process to readyQueue, sorts based on policy
         Process: PID, entryTime, CPUTime, remainingTime"""
-    readyQueue.append((pid, process[0], process[3], process[3]))
+    readyQueue.append((pid, float(process[0]), int(process[3]), int(process[3])))
     readyQueue.sort(key=lambda tup: tup[3])
 
 def removeFromCPU(pid, CPUs, readyQueue) :
@@ -38,7 +38,7 @@ def removeFromCPU(pid, CPUs, readyQueue) :
         if CPU and CPU[0] == pid :
             readyQueue.append(CPU)
             CPUs[CPUs.index(CPU)] = ()  # Add idle CPU
-            break  # No need to check rest
+            break  # No need to check rest of CPUs
 
 def changeQueue(pid, removeFrom, addTo) :
     """Moves Process from CPU/readyQueue into blockedQueue (or vice versa)
@@ -51,12 +51,13 @@ def changeQueue(pid, removeFrom, addTo) :
 
 def killProcess(pid, readyQueue, blockedQueue) :
     process2kill = [i for i in readyQueue if i[0] == pid]
+
     if process2kill :
         readyQueue = [i for i in readyQueue if i[0] != pid]
+        return process2kill[0]
     else :  # Not found in readyQueue, process must be blocked
         blockedQueue = [i for i in blockedQueue if i[0] != pid]
-
-    return process2kill if process2kill else [i for i in blockedQueue if i[0] == pid][0]
+        return [i for i in blockedQueue if i[0] == pid][0]
 
 def expropiateProcess(CPUs, CPU, readyQueue) :
     "If there's a shorter job in queue it is placed in CPU instead of the current one"
@@ -65,38 +66,41 @@ def expropiateProcess(CPUs, CPU, readyQueue) :
         readyQueue.sort(key=lambda tup: tup[3])
         CPUs[CPUs.index(CPU)] = readyQueue.pop(0)
 
-def updateCPUStatus(connection, CPUs, policy, time, readyQueue, terminatedQueue) :
+def updateCPUStatus(connection, CPUs, policy, readyQueue, terminatedQueue, last_time, curr_time) :
     """Substracts a second to the CPUs running processes, assigns process
         to idle ones, and verifies (SRT-only) if there's a shorter job"""
     for CPU in CPUs :
         # Verifies if CPU is not empty and process has pending CPU time
         if CPU and CPU[3] > 0 :
-            CPUs[CPUs.index(CPU)] = CPU[:3] + (int(CPU[3]) - 1,)
-            time += 1
+            # Work-around because of variable names
+            tempCPU = CPU[:3] + (CPU[3] - (curr_time - last_time),)
+            if tempCPU[3] < 0:
+                tempCPU = CPU[:3] + (0,)
+            CPUs[CPUs.index(CPU)] = tempCPU
+            CPU = tempCPU
         else :  # Is empty, assigns to CPU the next process ready2go
             if CPU and CPU[3] <= 0 :
                 # Logs terminated process info and its exit time
-                terminatedQueue.append(CPU + (time,))
-
-            CPUs[CPUs.index(CPU)] = readyQueue.pop(0)
+                terminatedQueue.append(CPU + (curr_time,))
+            if readyQueue :
+                CPUs[CPUs.index(CPU)] = readyQueue.pop(0)
 
         if policy == 'SRT' :
             expropiateProcess(CPUs, CPU, readyQueue)
 
-    return time
-
 def formatOutput(process, status) :
     "Helper function for printing process info. and its status"
-    print>> sys.stderr, "{}\t{}\t{}\t\t{}\n".format(process[0], process[2], process[3], status)
+    print>> sys.stderr, "{}\t{}\t   {}\t\t{}\n".format(process[0], process[2], process[3], status)
 
 def printProgress(CPUs, readyQueue, blockedQueue, terminatedQueue) :
     "Prints status and relevant info for each process received"
-    print>> sys.stderr, "-------------PROGRESS-------------"
-    print>> sys.stderr, "PID\tCPUtime\tTime Left\t\tStatus"
+    print>> sys.stderr, "----------------PROGRESS----------------"
+    print>> sys.stderr, "PID\tCPUtime\t   Time Left    Status"
     n = 1
     for process in CPUs :
-        formatOutput(process, "(ON CPU {})".format(n))
-        n += 1
+        if process :
+            formatOutput(process, "(ON CPU {})".format(n))
+            n += 1
 
     for process in readyQueue :
         formatOutput(process, "(IN QUEUE)")
@@ -107,44 +111,51 @@ def printProgress(CPUs, readyQueue, blockedQueue, terminatedQueue) :
     for process in terminatedQueue :
         formatOutput(process, "(TERMINATED AT t={} s)".format(process[4]))
 
-def scheduler(data, policy, num_cpus, time) :
+def scheduler(data, policy, num_cpus, curr_time) :
     "Focuses on executing the process with the Shortest Remaining Time left"
     readyQueue = []
     blockedQueue = []
     terminatedQueue = []
     # Keeps track of last-assigned PID
-    PIDCounter = 0
+    PIDCounter = 1
+    # Var. for time management
+    last_time = 0
     # Makes list of idle CPUs, each one contains process info to be executed
     CPUs = [() for i in range(0, num_cpus)]
 
     while True:
-        pid = data[3]  # Helper
-
         if 'CREATE' in data :
             createProcess(readyQueue, data, PIDCounter)
-            connection.sendall('process created with PID: ', PIDCounter)
+            connection.sendall('process created with PID: {}'.format(PIDCounter))
             PIDCounter += 1
 
         elif 'I/O' in data :
+            pid = int(data[3])  # Helper
             if 'INICIA' in data :
                 removeFromCPU(pid, CPUs, readyQueue)
                 changeQueue(pid, readyQueue, blockedQueue)
-                connection.sendall('process #', pid, ' has entered I/O')
+                connection.sendall('process #{} has entered I/O'.format(pid))
             else :  # TERMINA I/O
                 changeQueue(pid, blockedQueue, readyQueue)
-                connection.sendall('process #', pid, ' has successfully exited I/O')
+                connection.sendall('process #{} has successfully exited I/O'.format(pid))
 
         elif 'KILL' in data :
+            pid = int(data[2])  # Helper
             removeFromCPU(pid, CPUs, readyQueue)
-            killedProcess = killProcess(pid, blockedQueue, readyQueue)
-            terminatedQueue.append(killedProcess + (time,))
-            connection.sendall('process #', killedProcess[0], ' terminated. CPU time: ',
-                               killedProcess[2] - killedProcess[3])
+            killedProcess = killProcess(pid, readyQueue, blockedQueue)
+            terminatedQueue.append(killedProcess + (curr_time,))
+            connection.sendall('process #{} terminated. CPU time: {}'
+                            .format(killedProcess[0], killedProcess[2] - killedProcess[3]))
+        elif 'END' in data :
+            break
+        else :
+            connection.sendall('received {}'.format(' '.join(data)))
 
-        time = updateCPUStatus(connection, CPUs, policy, time, readyQueue, terminatedQueue)
+        updateCPUStatus(connection, CPUs, policy, readyQueue, terminatedQueue, last_time, curr_time)
         printProgress(CPUs, readyQueue, blockedQueue, terminatedQueue)
-
         data = receiveData()
+        last_time = curr_time
+        curr_time = float(data[0])
 
 
 if __name__ == '__main__':
